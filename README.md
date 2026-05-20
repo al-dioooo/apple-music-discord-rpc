@@ -1,87 +1,66 @@
-# apple-music-discord-rpc
+# 🎵 Apple Music Discord RPC
 
-Deno + JavaScript for Automation (JXA) Discord Rich Presence client for the
-macOS Apple Music app (Catalina and later) and legacy iTunes.
+> [!IMPORTANT]
+> **Personal Use Only**
+> This repository is a personal fork of [NextFire/apple-music-discord-rpc](https://github.com/NextFire/apple-music-discord-rpc) and is customized for personal use. It is **not** intended for public consumption, distribution, or external support.
+
+Deno + JavaScript for Automation (JXA) Discord Rich Presence client for the macOS Apple Music app (Catalina and later) and legacy iTunes.
 
 Works with local tracks and the Apple Music streaming service.
 
-## Features
+---
 
-- Can start in the background at login
-- No status bar icon clutter
-- Small and (relatively) easy-to-understand script
-- Presence is enabled only when music is actually playing
-- Apple Music matching
-- Local artwork temporary upload on litterbox.catbox.moe as a fallback
+## ✨ Features
 
-<img width="230" height="47" alt="image" src="https://github.com/user-attachments/assets/2e168586-4202-46a3-a2d5-0e4e499ecdc6" />
-<img width="296" height="128" alt="image" src="https://github.com/user-attachments/assets/d5c01904-d43e-4f10-990d-2c75ff3acc61" />
+- **Zero Clutter**: Runs silently in the background at login with no menu bar or dock icons.
+- **Smart Presence**: Presence updates automatically and is only active when music is actually playing.
+- **Artwork Fallback**: Matches Apple Music streaming metadata and falls back to local artwork uploads via `litterbox.catbox.moe`.
+- **Lightweight**: Written in TypeScript and executed via Deno, resulting in a minimal memory and CPU footprint.
 
-## Getting Started
+<div align="center">
+  <img width="230" height="47" alt="Discord Rich Presence Preview" src="https://github.com/user-attachments/assets/2e168586-4202-46a3-a2d5-0e4e499ecdc6" style="margin-right: 10px;" />
+  <img width="296" height="128" alt="Presence Detail Preview" src="https://github.com/user-attachments/assets/d5c01904-d43e-4f10-990d-2c75ff3acc61" />
+</div>
 
-Follow one of the two methods below to download the script and enable the macOS
-launch agent so it starts at login.
+---
 
-### Homebrew (Recommended)
+## 🛠️ Personal Setup & Installation
 
-#### Install
+Since this is a personal configuration, install and run the service using the included local scripts:
 
-After installing [Homebrew](https://brew.sh), run:
+### 1. Prerequisites
 
-```
-brew install nextfire/tap/apple-music-discord-rpc
-brew services restart apple-music-discord-rpc
-```
+Ensure Deno (v2+) is installed on macOS:
 
-These commands add [this tap](https://github.com/NextFire/homebrew-tap) to
-Homebrew, install the `apple-music-discord-rpc` formula (and Deno), and enable
-the launch agent, starting it immediately.
-
-The `music-rpc.ts` executable is also placed in your `PATH`.
-
-#### Upgrade
-
-```
-brew upgrade apple-music-discord-rpc
-brew services restart apple-music-discord-rpc
+```bash
+deno --version
 ```
 
-#### Uninstall
+### 2. Install & Start Launch Agent
 
-```
-brew services stop apple-music-discord-rpc
-brew remove apple-music-discord-rpc
-brew untap nextfire/tap
-```
+To set up the launch agent to automatically run at login, navigate to the project directory and run the installer script:
 
-### Shell Scripts
-
-#### Install
-
-Install Deno (v2+), clone the repository, and run `./scripts/install.sh`:
-
-```
-git clone https://github.com/NextFire/apple-music-discord-rpc.git
-cd apple-music-discord-rpc/
+```bash
 ./scripts/install.sh
 ```
 
-It copies the [launch agent](/scripts/moe.yuru.music-rpc.plist) into
-`~/Library/LaunchAgents/` and edits it accordingly.
+This script copies the plist file (`moe.yuru.music-rpc.plist`) to `~/Library/LaunchAgents/`, configures the current path, and loads the daemon.
 
-#### Upgrade
+### 3. Uninstall Launch Agent
 
-```
-cd apple-music-discord-rpc/
-git fetch && git reset --hard origin/main
-./scripts/install.sh
-```
+To stop the background service and remove the launch agent, run:
 
-#### Uninstall
-
-```
-cd apple-music-discord-rpc/
+```bash
 ./scripts/uninstall.sh
-cd ../
-rm -rf apple-music-discord-rpc/
 ```
+
+---
+
+## 💻 Local Development & Debugging
+
+To run the RPC client manually in the foreground (with full logging output):
+
+```bash
+deno run --allow-run --allow-net --allow-read --allow-write --allow-ffi --allow-import --unstable-kv music-rpc.ts
+```
+
