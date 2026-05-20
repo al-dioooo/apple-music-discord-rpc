@@ -14,6 +14,7 @@ class AppleMusicDiscordRPC {
   static readonly KV_VERSION = 3;
 
   private startTime!: number;
+  private pollActive = false;
 
   /**
    * @private Use `AppleMusicDiscordRPC.create()` instead.
@@ -84,6 +85,7 @@ class AppleMusicDiscordRPC {
     console.log("musicRunning:", musicRunning);
 
     if (!musicRunning) {
+      this.pollActive = false;
       await this.rpc.clearActivity();
       return this.defaultTimeout;
     }
@@ -95,6 +97,7 @@ class AppleMusicDiscordRPC {
       case "playing": {
         const { activity, delta } = await this.getPlayingActivity();
         await this.rpc.setActivity(activity);
+        this.startPlayStatusPoll();
         return Math.min(
           (delta ?? this.defaultTimeout) + 1000,
           this.defaultTimeout,
@@ -103,13 +106,88 @@ class AppleMusicDiscordRPC {
 
       case "paused":
       case "stopped": {
+        this.pollActive = false;
         await this.rpc.clearActivity();
         return this.defaultTimeout;
       }
 
       default:
+        this.pollActive = false;
         throw new Error(`Unknown state: ${state}`);
     }
+  }
+
+  async startPlayStatusPoll(): Promise<void> {
+    if (this.pollActive) return;
+    this.pollActive = true;
+    console.log("Starting play status poll...");
+
+    let lastSyncTime = Date.now();
+    let lastSyncPosition = 0;
+    let lastTrackId = "";
+
+    try {
+      const initialProps = await getMusicProperties(this.appName).catch(() => null);
+      if (initialProps) {
+        lastSyncPosition = initialProps.playerPosition;
+        lastTrackId = initialProps.persistentID;
+      }
+    } catch {
+      // Ignore initial fetch errors
+    }
+
+    // Run the polling loop in the background asynchronously
+    (async () => {
+      while (this.pollActive) {
+        await sleep(5000); // Check every 5 seconds
+        if (!this.pollActive) break;
+
+        try {
+          const musicRunning = await isMusicRunning(this.appName);
+          if (!musicRunning) {
+            this.pollActive = false;
+            await this.rpc.clearActivity();
+            break;
+          }
+
+          const state = await getMusicState(this.appName);
+          if (state !== "playing") {
+            this.pollActive = false;
+            await this.rpc.clearActivity();
+            break;
+          }
+
+          const properties = await getMusicProperties(this.appName);
+          const currentTrackId = properties.persistentID;
+          const currentPosition = properties.playerPosition;
+          const now = Date.now();
+
+          const expectedPosition = lastSyncPosition + (now - lastSyncTime) / 1000;
+          const diff = Math.abs(currentPosition - expectedPosition);
+
+          // Sync if track changed, position went backward (repeated/rewinded), or seeked by > 3s
+          if (
+            currentTrackId !== lastTrackId ||
+            currentPosition < lastSyncPosition ||
+            diff > 3
+          ) {
+            console.log(
+              `Timeline sync triggered: trackChanged=${currentTrackId !== lastTrackId}, repeated=${currentPosition < lastSyncPosition}, seekDiff=${diff.toFixed(1)}s`
+            );
+            await this.setActivity();
+            lastSyncTime = Date.now();
+            lastSyncPosition = currentPosition;
+            lastTrackId = currentTrackId;
+          } else {
+            lastSyncTime = now;
+            lastSyncPosition = currentPosition;
+          }
+        } catch (err) {
+          console.error("Error in play status poll:", err);
+        }
+      }
+      console.log("Play status poll stopped.");
+    })();
   }
 
   async getPlayingActivity(): Promise<{ activity: Activity; delta?: number }> {
@@ -530,6 +608,24 @@ async function fetchTrackExtras(
   return extras;
 }
 
+async function fetchWithTimeout(
+  input: string | URL | Request,
+  init?: RequestInit,
+  timeoutMs = 5000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+    return response;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 async function iTunesSearch(
   { name, artist, album }: iTunesProperties,
 ): Promise<iTunesSearchResponse | undefined> {
@@ -545,7 +641,7 @@ async function iTunesSearch(
   console.log("iTunes search", url);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const resp = await fetch(url);
+    const resp = await fetchWithTimeout(url);
     if (resp.ok) {
       const json = await resp.json();
       return json as iTunesSearchResponse;
@@ -595,12 +691,13 @@ async function litterboxUpload(
   formData.append("reqtype", "fileupload");
   formData.append("time", "1h");
   formData.append("fileToUpload", blob, "artwork.jpg");
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     "https://litterbox.catbox.moe/resources/internals/api.php",
     {
       method: "POST",
       body: formData,
     },
+    8000, // 8 seconds timeout for file uploads
   );
   if (!response.ok) {
     throw new Error(`Failed to upload to catbox.moe: ${response.statusText}`);
