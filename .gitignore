@@ -1,2 +1,3 @@
 /cache_v?.sqlite3*
-/music-rpc.log
+/music-rpc.log*
+/music-rpc.boot.log

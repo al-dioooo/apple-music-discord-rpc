@@ -61,6 +61,8 @@ To stop the background service and remove the launch agent, run:
 To run the RPC client manually in the foreground (with full logging output):
 
 ```bash
-deno run --allow-run --allow-net --allow-read --allow-write --allow-ffi --allow-import --unstable-kv music-rpc.ts
+deno run --allow-env --allow-run --allow-net --allow-read --allow-write --allow-ffi --allow-import --unstable-kv music-rpc.ts
 ```
+
+Set `DEBUG=1` to also log per-track state, iTunes lookups, and connection attempts.
 

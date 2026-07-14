@@ -18,9 +18,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>music-rpc.log</string>
+	<string>music-rpc.boot.log</string>
 	<key>StandardOutPath</key>
-	<string>music-rpc.log</string>
+	<string>music-rpc.boot.log</string>
 	<key>WorkingDirectory</key>
 	<string>/absolute/path/to/cloned/repo</string>
 </dict>

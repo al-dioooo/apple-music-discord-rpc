@@ -1,10 +1,475 @@
 #!/usr/bin/env deno run --allow-env --allow-run --allow-net --allow-read --allow-write --allow-ffi --allow-import --unstable-kv
-import type { Activity } from "https://deno.land/x/discord_rpc@0.3.2/mod.ts";
-import { Client } from "https://deno.land/x/discord_rpc@0.3.2/mod.ts";
 import type {} from "https://raw.githubusercontent.com/NextFire/jxa/v0.0.5/run/global.d.ts";
 import type { iTunes } from "https://raw.githubusercontent.com/NextFire/jxa/v0.0.5/run/types/core.d.ts";
 
-//#region RPC
+//#region Utilities
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Abortable sleep: resolves after `ms` or immediately when `signal` aborts. */
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const id = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(id);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? (err.stack ?? err.message) : String(err);
+}
+
+/** Read an env var, tolerating a missing --allow-env permission. */
+function env(key: string): string | undefined {
+  try {
+    return Deno.env.get(key);
+  } catch {
+    return undefined;
+  }
+}
+
+const DEBUG = !!env("DEBUG");
+function debug(...args: unknown[]): void {
+  if (DEBUG) console.log(...args);
+}
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
+//#endregion
+
+//#region Logger
+/**
+ * Size-capped, self-rotating logger that owns `music-rpc.log`.
+ *
+ * launchd redirects the process's stdout/stderr to a separate boot log, so this
+ * is the sole writer of the main log file and can safely rotate it (truncating a
+ * file launchd holds open with O_APPEND would corrupt offsets). Overrides
+ * `console.log`/`console.error`.
+ */
+class Logger {
+  static #file: Deno.FsFile | null = null;
+  static #path = "";
+  static #bytes = 0;
+  static #maxBytes = 5_000_000;
+  static #tty = false;
+  static #origLog: (...args: unknown[]) => void = console.log.bind(console);
+  static #origError: (...args: unknown[]) => void = console.error.bind(console);
+
+  static init(path: string, maxBytes = 5_000_000): void {
+    this.#path = path;
+    this.#maxBytes = maxBytes;
+    try {
+      this.#tty = Deno.stdout.isTerminal();
+    } catch {
+      this.#tty = false;
+    }
+    this.#origLog = console.log.bind(console);
+    this.#origError = console.error.bind(console);
+    this.#open();
+    console.log = (...args: unknown[]) => this.#write("LOG", args);
+    console.error = (...args: unknown[]) => this.#write("ERR", args);
+  }
+
+  static #open(): void {
+    try {
+      this.#file = Deno.openSync(this.#path, { create: true, write: true, append: true });
+      this.#bytes = Deno.statSync(this.#path).size;
+    } catch {
+      this.#file = null;
+    }
+  }
+
+  static #write(level: string, args: unknown[]): void {
+    const text = formatLogArgs(args);
+    const line = `${new Date().toISOString()} [${level}] ${text}\n`;
+    if (this.#file) {
+      try {
+        const bytes = TEXT_ENCODER.encode(line);
+        this.#file.writeSync(bytes);
+        this.#bytes += bytes.byteLength;
+        if (this.#bytes > this.#maxBytes) this.#rotate();
+      } catch {
+        this.#reopen();
+      }
+    }
+    // Echo to the real console when attached to a terminal (foreground dev), or
+    // as a fallback (→ launchd boot log) if the managed file could not be opened.
+    if (this.#tty || !this.#file) {
+      const orig = level === "ERR" ? this.#origError : this.#origLog;
+      try {
+        orig(text);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  static #rotate(): void {
+    try {
+      this.#file?.close();
+    } catch {
+      // ignore
+    }
+    this.#file = null;
+    try {
+      Deno.renameSync(this.#path, `${this.#path}.1`);
+    } catch {
+      // ignore
+    }
+    this.#open();
+  }
+
+  static #reopen(): void {
+    try {
+      this.#file?.close();
+    } catch {
+      // ignore
+    }
+    this.#file = null;
+    this.#open();
+  }
+}
+
+function fmtArg(a: unknown): string {
+  if (typeof a === "string") return a;
+  if (a instanceof Error) return a.stack ?? a.message;
+  try {
+    return JSON.stringify(a);
+  } catch {
+    return String(a);
+  }
+}
+
+/** Minimal printf-style formatting so existing `%s`/`%d` call sites keep working. */
+function formatLogArgs(args: unknown[]): string {
+  if (args.length === 0) return "";
+  const [first, ...rest] = args;
+  if (typeof first === "string" && /%[sdoj%]/.test(first)) {
+    let i = 0;
+    const out = first.replace(/%[sdoj%]/g, (m) => {
+      if (m === "%%") return "%";
+      if (i >= rest.length) return m;
+      return fmtArg(rest[i++]);
+    });
+    const remaining = rest.slice(i).map(fmtArg);
+    return [out, ...remaining].join(" ");
+  }
+  return args.map(fmtArg).join(" ");
+}
+//#endregion
+
+//#region Discord IPC
+export class DiscordNotFoundError extends Error {}
+export class DiscordConnectionError extends Error {}
+
+/** Discord Rich Presence activity (the subset this app sets). */
+export interface Activity {
+  type?: number; // 2 = "Listening to"
+  details?: string;
+  state?: string;
+  status_display_type?: number;
+  details_url?: string;
+  state_url?: string;
+  timestamps?: { start?: number; end?: number };
+  assets?: {
+    large_image?: string;
+    large_text?: string;
+    large_url?: string;
+    small_image?: string;
+    small_text?: string;
+  };
+  buttons?: { label: string; url: string }[];
+}
+
+const OP_HANDSHAKE = 0;
+const OP_FRAME = 1;
+const OP_CLOSE = 2;
+const OP_PING = 3;
+const OP_PONG = 4;
+const MAX_FRAME_LEN = 64 * 1024;
+
+function encodeFrame(op: number, payloadObj: unknown): Uint8Array {
+  const payload = TEXT_ENCODER.encode(JSON.stringify(payloadObj));
+  const data = new Uint8Array(8 + payload.byteLength);
+  const view = new DataView(data.buffer);
+  view.setInt32(0, op, true);
+  view.setInt32(4, payload.byteLength, true);
+  data.set(payload, 8);
+  return data;
+}
+
+let darwinTempDir: string | null | undefined; // undefined = not computed; null = unavailable
+
+/** The authoritative macOS per-user temp dir; where the Discord GUI app puts its socket. */
+async function getDarwinTempDir(): Promise<string | null> {
+  if (darwinTempDir !== undefined) return darwinTempDir;
+  try {
+    const out = await new Deno.Command("getconf", {
+      args: ["DARWIN_USER_TEMP_DIR"],
+      stdout: "piped",
+      stderr: "null",
+    }).output();
+    const dir = TEXT_DECODER.decode(out.stdout).trim();
+    darwinTempDir = dir.length ? dir.replace(/\/+$/, "") : null;
+  } catch {
+    darwinTempDir = null;
+  }
+  return darwinTempDir;
+}
+
+function ipcCandidatePaths(dirs: string[]): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of dirs) {
+    if (!raw) continue;
+    const dir = raw.replace(/\/+$/, "");
+    for (let i = 0; i <= 9; i++) {
+      const p = `${dir}/discord-ipc-${i}`;
+      if (!seen.has(p)) {
+        seen.add(p);
+        paths.push(p);
+      }
+    }
+  }
+  return paths;
+}
+
+/**
+ * Minimal Discord IPC client over the local unix socket.
+ *
+ * - `SET_ACTIVITY` is fire-and-forget (no per-nonce command queue → no leak).
+ * - A background read loop drains and discards frames; its only job is to detect
+ *   a dropped connection (EOF / error), even while the app is idle and never
+ *   writes. This is what makes mid-session Discord crashes recoverable.
+ * - All writes serialize through a single promise chain (no interleaved frames).
+ */
+export class DiscordIPC {
+  #conn: Deno.Conn;
+  #clientId: string;
+  #onLost: () => void;
+  #writeChain: Promise<unknown> = Promise.resolve();
+  #lost = false;
+  #closed = false;
+  #header = new Uint8Array(8);
+  #headerView: DataView;
+
+  private constructor(conn: Deno.Conn, clientId: string, onLost: () => void) {
+    this.#conn = conn;
+    this.#clientId = clientId;
+    this.#onLost = onLost;
+    this.#headerView = new DataView(this.#header.buffer);
+  }
+
+  /**
+   * Discover Discord's socket and complete the handshake.
+   * @throws {DiscordNotFoundError} when no `discord-ipc-*` socket is connectable.
+   * @throws {DiscordConnectionError} on handshake failure/timeout.
+   */
+  static async connect(
+    clientId: string,
+    onLost: () => void,
+    handshakeTimeoutMs = 10_000,
+  ): Promise<DiscordIPC> {
+    const conn = await DiscordIPC.#findSocket();
+    const ipc = new DiscordIPC(conn, clientId, onLost);
+    try {
+      await ipc.#handshake(handshakeTimeoutMs);
+    } catch (err) {
+      ipc.#closed = true;
+      try {
+        conn.close();
+      } catch {
+        // ignore
+      }
+      throw err instanceof DiscordConnectionError ? err : new DiscordConnectionError(errMsg(err));
+    }
+    ipc.#startReadLoop();
+    return ipc;
+  }
+
+  static async #findSocket(): Promise<Deno.Conn> {
+    const dirs = [
+      env("XDG_RUNTIME_DIR"),
+      env("TMPDIR"),
+      (await getDarwinTempDir()) ?? undefined,
+      env("TMP"),
+      env("TEMP"),
+      "/tmp",
+    ].filter((d): d is string => !!d);
+
+    for (const path of ipcCandidatePaths(dirs)) {
+      try {
+        return await Deno.connect({ path, transport: "unix" });
+      } catch {
+        // try next candidate
+      }
+    }
+    throw new DiscordNotFoundError("no discord-ipc socket found");
+  }
+
+  async #handshake(timeoutMs: number): Promise<void> {
+    await this.#write(OP_HANDSHAKE, { v: 1, client_id: this.#clientId });
+    let timer: number | undefined;
+    const timeoutP = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new DiscordConnectionError("handshake timeout")),
+        timeoutMs,
+      );
+    });
+    const readyP = this.#readUntilReady();
+    readyP.catch(() => {}); // defensive: swallow if the timeout wins the race
+    try {
+      await Promise.race([readyP, timeoutP]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async #readUntilReady(): Promise<void> {
+    for (;;) {
+      const frame = await this.#readFrame();
+      if (frame === null) throw new DiscordConnectionError("connection closed during handshake");
+      const { op, body } = frame;
+      if (op === OP_CLOSE) {
+        throw new DiscordConnectionError(`close during handshake: (${body?.code}) ${body?.message}`);
+      }
+      if (op === OP_PING) {
+        this.#write(OP_PONG, body).catch(() => {});
+        continue;
+      }
+      if (body && body.cmd === "DISPATCH" && body.evt === "READY") return;
+      // ignore any other frame until READY
+    }
+  }
+
+  /** Fire-and-forget: resolves when the frame is flushed, not when Discord ACKs. */
+  setActivity(activity?: Activity | null): Promise<void> {
+    return this.#write(OP_FRAME, {
+      cmd: "SET_ACTIVITY",
+      args: { pid: Deno.pid, activity: activity ?? null },
+      nonce: crypto.randomUUID(),
+    });
+  }
+
+  clearActivity(): Promise<void> {
+    return this.setActivity(null);
+  }
+
+  /** Intentional shutdown; suppresses the onLost callback so teardown's own EOF is silent. */
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#onLost = () => {};
+    try {
+      this.#conn.close();
+    } catch {
+      // ignore
+    }
+  }
+
+  #write(op: number, payloadObj: unknown): Promise<void> {
+    const data = encodeFrame(op, payloadObj);
+    const run = this.#writeChain.then(async () => {
+      if (this.#closed || this.#lost) throw new DiscordConnectionError("connection closed");
+      await this.#writeAll(data);
+    });
+    this.#writeChain = run.catch(() => {}); // keep the chain alive after a failure
+    run.catch(() => this.#handleLost()); // any write failure ⇒ connection lost
+    return run;
+  }
+
+  async #writeAll(data: Uint8Array): Promise<void> {
+    let offset = 0;
+    while (offset < data.byteLength) {
+      const n = await this.#conn.write(data.subarray(offset));
+      if (n <= 0) throw new DiscordConnectionError("write returned 0");
+      offset += n;
+    }
+  }
+
+  #startReadLoop(): void {
+    (async () => {
+      try {
+        while (!this.#closed && !this.#lost) {
+          const frame = await this.#readFrame();
+          if (frame === null) break; // EOF
+          if (frame.op === OP_PING) {
+            this.#write(OP_PONG, frame.body).catch(() => {});
+          }
+          // discard everything else (SET_ACTIVITY acks, dispatches, …)
+        }
+      } catch {
+        // read error ⇒ connection lost
+      } finally {
+        this.#handleLost();
+      }
+    })();
+  }
+
+  async #readFrame(): Promise<{ op: number; body: any } | null> {
+    let headerRead = 0;
+    while (headerRead < 8) {
+      const n = await this.#conn.read(this.#header.subarray(headerRead));
+      if (n === null) return null;
+      headerRead += n;
+    }
+    const op = this.#headerView.getInt32(0, true);
+    const len = this.#headerView.getInt32(4, true);
+    if (len < 0 || len > MAX_FRAME_LEN) {
+      throw new DiscordConnectionError(`invalid frame length ${len}`);
+    }
+    const payload = new Uint8Array(len);
+    let bodyRead = 0;
+    while (bodyRead < len) {
+      const n = await this.#conn.read(payload.subarray(bodyRead));
+      if (n === null) return null;
+      bodyRead += n;
+    }
+    let body: any;
+    if (len > 0) {
+      try {
+        body = JSON.parse(TEXT_DECODER.decode(payload));
+      } catch {
+        throw new DiscordConnectionError("invalid JSON frame");
+      }
+    }
+    return { op, body };
+  }
+
+  #handleLost(): void {
+    if (this.#lost || this.#closed) return;
+    this.#lost = true;
+    try {
+      this.#conn.close();
+    } catch {
+      // ignore
+    }
+    const cb = this.#onLost;
+    queueMicrotask(() => cb());
+  }
+}
+//#endregion
+
+//#region RPC supervisor
+type Desired =
+  | { kind: "cleared" }
+  | { kind: "playing"; activity: Activity; trackId: string; position: number; at: number };
+
+const IDLE_RECHECK_MS = 15_000;
+const BACKOFF_BASE_MS = 2_000;
+const BACKOFF_CAP_MS = 60_000;
+const STABLE_MS = 10_000;
+const POLL_MS = 5_000;
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+
 class AppleMusicDiscordRPC {
   static readonly CLIENT_IDS: Record<iTunesAppName, string> = {
     iTunes: "979297966739300416",
@@ -13,231 +478,242 @@ class AppleMusicDiscordRPC {
   // Increment after TrackExtras update
   static readonly KV_VERSION = 3;
 
-  private startTime!: number;
-  private pollActive = false;
+  #ipc: DiscordIPC | null = null;
+  #state: "disconnected" | "connecting" | "connected" = "disconnected";
+  #desired: Desired = { kind: "cleared" };
+  #lastPushedJson: string | null = null;
+  #refreshing = false;
+  #refreshQueued = false;
+  #pollAbort: AbortController | null = null;
+  #lost: { promise: Promise<void>; resolve: () => void } | null = null;
+  #attempt = 0;
+  #connectedAt = 0;
+  #lastLoggedState = "";
 
   /**
    * @private Use `AppleMusicDiscordRPC.create()` instead.
    */
-  constructor(
+  private constructor(
     private readonly appName: iTunesAppName,
-    private readonly rpc: Client,
+    private readonly clientId: string,
     private readonly kv: Deno.Kv,
-    private readonly defaultTimeout: number = 15 * 1000,
-    private readonly maxRuntime: number = 24 * 60 * 60 * 1000, // 24 hours
   ) {}
 
+  static async create(): Promise<AppleMusicDiscordRPC> {
+    const macOSVersion = await this.getMacOSVersion();
+    const appName: iTunesAppName = macOSVersion >= 10.15 ? "Music" : "iTunes";
+    const kv = await Deno.openKv(`cache_v${this.KV_VERSION}.sqlite3`);
+    return new this(appName, this.CLIENT_IDS[appName], kv);
+  }
+
+  /** Run the persistent Music listener and the Discord connection supervisor in parallel. */
   async run(): Promise<void> {
-    this.startTime = Date.now();
-    while (true) {
+    await Promise.race([this.#runMusicListener(), this.#runSupervisor()]);
+  }
+
+  #runMusicListener(): Promise<never> {
+    // The Swift notification listener persists across Discord reconnects; each
+    // event just asks for a refresh of the desired activity.
+    return listenToEvents(() => this.#scheduleRefresh());
+  }
+
+  async #runSupervisor(): Promise<never> {
+    for (;;) {
       try {
-        await this.setActivityLoop();
+        if (!(await isDiscordRunning())) {
+          this.#logState("idle", "No Discord client is running; waiting");
+          this.#resetBackoff();
+          await sleep(IDLE_RECHECK_MS);
+          continue;
+        }
+
+        this.#state = "connecting";
+        this.#newLostSignal();
+        debug("Connecting to Discord RPC…");
+
+        let ipc: DiscordIPC;
+        try {
+          ipc = await DiscordIPC.connect(
+            this.clientId,
+            () => this.#signalLost(),
+            HANDSHAKE_TIMEOUT_MS,
+          );
+        } catch (err) {
+          if (err instanceof DiscordNotFoundError) {
+            // Discord process exists but no socket yet ⇒ treat as "not ready", quiet idle.
+            this.#logState("idle", "Discord socket not found; waiting");
+            this.#resetBackoff();
+            await sleep(IDLE_RECHECK_MS);
+          } else {
+            const delay = this.#nextBackoff();
+            this.#logState("backoff", `Connect failed: ${errMsg(err)} — retrying in ${delay}ms`);
+            await sleep(delay);
+          }
+          continue;
+        }
+
+        // ---- CONNECTED ----
+        this.#ipc = ipc;
+        this.#state = "connected";
+        this.#connectedAt = Date.now();
+        this.#lastPushedJson = null; // force a re-push of the current activity
+        this.#logState("connected", "Connected to Discord RPC");
+        await this.#scheduleRefresh(); // re-apply desired presence immediately
+
+        await this.#lost!.promise; // park until the connection is lost
+
+        // ---- DISCONNECTED ----
+        const stable = Date.now() - this.#connectedAt >= STABLE_MS;
+        this.#logState("disconnected", "Discord connection lost");
+        this.#teardown();
+        if (stable) this.#resetBackoff(); // a healthy session that just ended → reset
+        await sleep(this.#nextBackoff());
       } catch (err) {
-        console.error(err);
-      }
-      console.log("Reconnecting in %dms", this.defaultTimeout);
-      await sleep(this.defaultTimeout);
-    }
-  }
-
-  tryCloseRPC(): void {
-    if (this.rpc.ipc) {
-      console.log("Attempting to close connection to Discord RPC");
-      try {
-        this.rpc.close();
-      } finally {
-        console.log("Connection to Discord RPC closed");
-        this.rpc.ipc = undefined;
+        // Transient failure (e.g. osascript/automation error). Never let it kill
+        // the supervisor — tear down, back off, and keep going.
+        console.error("Supervisor error:", errMsg(err));
+        this.#teardown();
+        await sleep(this.#nextBackoff());
       }
     }
   }
 
-  async setActivityLoop(): Promise<void> {
-    const discordRunning = await isDiscordRunning();
-    if (!discordRunning) {
-      console.log("No Discord client is running");
+  #signalLost(): void {
+    if (this.#state === "connected") this.#state = "disconnected";
+    this.#lost?.resolve();
+  }
+
+  #newLostSignal(): void {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    this.#lost = { promise, resolve };
+  }
+
+  #teardown(): void {
+    this.#stopPoll();
+    this.#ipc?.close();
+    this.#ipc = null;
+    this.#state = "disconnected";
+  }
+
+  #nextBackoff(): number {
+    const base = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** this.#attempt);
+    this.#attempt++;
+    return Math.floor(base * (0.8 + Math.random() * 0.4)); // ±20% jitter
+  }
+
+  #resetBackoff(): void {
+    this.#attempt = 0;
+  }
+
+  #logState(state: string, msg: string): void {
+    if (state === this.#lastLoggedState) return;
+    this.#lastLoggedState = state;
+    console.log(msg);
+  }
+
+  /** Single-flight refresh with coalescing so bursts collapse into one recompute. */
+  async #scheduleRefresh(): Promise<void> {
+    if (this.#refreshing) {
+      this.#refreshQueued = true;
       return;
     }
+    this.#refreshing = true;
     try {
-      await this.rpc.connect();
-      console.log("Connected to Discord RPC");
-
-      // Initial status update
-      await this.setActivity();
-
-      // Listen for Apple Music real-time events
-      await listenToEvents(async (event) => {
-        if (Date.now() - this.startTime >= this.maxRuntime) {
-          console.log("Max runtime reached, restarting to clear memory");
-          Deno.exit(0);
+      do {
+        this.#refreshQueued = false;
+        try {
+          await this.#computeDesired();
+        } catch (err) {
+          // e.g. Music quit mid-query — log and carry on; do NOT tear down Discord.
+          console.error("Refresh failed:", errMsg(err));
         }
-        console.log("Player state changed:", event["Player State"]);
-        await this.setActivity();
-      });
+      } while (this.#refreshQueued);
     } finally {
-      // Ensure the connection is properly closed
-      this.tryCloseRPC();
+      this.#refreshing = false;
     }
   }
 
-  async setActivity(): Promise<number> {
-    const musicRunning = await isMusicRunning(this.appName);
-    console.log("musicRunning:", musicRunning);
-
-    if (!musicRunning) {
-      this.pollActive = false;
-      await this.rpc.clearActivity();
-      return this.defaultTimeout;
+  async #computeDesired(): Promise<void> {
+    if (!(await isMusicRunning(this.appName))) {
+      this.#setCleared();
+      this.#stopPoll();
+      this.#pushDesired();
+      return;
     }
 
     const state = await getMusicState(this.appName);
-    console.log("state:", state);
+    debug("state:", state);
 
-    switch (state) {
-      case "playing": {
-        const { activity, delta } = await this.getPlayingActivity();
-        await this.rpc.setActivity(activity);
-        this.startPlayStatusPoll();
-        return Math.min(
-          (delta ?? this.defaultTimeout) + 1000,
-          this.defaultTimeout,
-        );
-      }
-
-      case "paused":
-      case "stopped": {
-        this.pollActive = false;
-        await this.rpc.clearActivity();
-        return this.defaultTimeout;
-      }
-
-      default:
-        this.pollActive = false;
-        throw new Error(`Unknown state: ${state}`);
+    if (state === "playing") {
+      const properties = await getMusicProperties(this.appName);
+      const activity = await this.#buildActivity(properties);
+      this.#desired = {
+        kind: "playing",
+        activity,
+        trackId: properties.persistentID,
+        position: properties.playerPosition,
+        at: Date.now(),
+      };
+      this.#pushDesired();
+      this.#startPoll();
+    } else {
+      // paused | stopped | unknown
+      this.#setCleared();
+      this.#stopPoll();
+      this.#pushDesired();
     }
   }
 
-  async startPlayStatusPoll(): Promise<void> {
-    if (this.pollActive) return;
-    this.pollActive = true;
-    console.log("Starting play status poll...");
-
-    let lastSyncTime = Date.now();
-    let lastSyncPosition = 0;
-    let lastTrackId = "";
-
-    try {
-      const initialProps = await getMusicProperties(this.appName).catch(() => null);
-      if (initialProps) {
-        lastSyncPosition = initialProps.playerPosition;
-        lastTrackId = initialProps.persistentID;
-      }
-    } catch {
-      // Ignore initial fetch errors
-    }
-
-    // Run the polling loop in the background asynchronously
-    (async () => {
-      while (this.pollActive) {
-        await sleep(5000); // Check every 5 seconds
-        if (!this.pollActive) break;
-
-        try {
-          const musicRunning = await isMusicRunning(this.appName);
-          if (!musicRunning) {
-            this.pollActive = false;
-            await this.rpc.clearActivity();
-            break;
-          }
-
-          const state = await getMusicState(this.appName);
-          if (state !== "playing") {
-            this.pollActive = false;
-            await this.rpc.clearActivity();
-            break;
-          }
-
-          const properties = await getMusicProperties(this.appName);
-          const currentTrackId = properties.persistentID;
-          const currentPosition = properties.playerPosition;
-          const now = Date.now();
-
-          const expectedPosition = lastSyncPosition + (now - lastSyncTime) / 1000;
-          const diff = Math.abs(currentPosition - expectedPosition);
-
-          // Sync if track changed, position went backward (repeated/rewinded), or seeked by > 3s
-          if (
-            currentTrackId !== lastTrackId ||
-            currentPosition < lastSyncPosition ||
-            diff > 3
-          ) {
-            console.log(
-              `Timeline sync triggered: trackChanged=${currentTrackId !== lastTrackId}, repeated=${currentPosition < lastSyncPosition}, seekDiff=${diff.toFixed(1)}s`
-            );
-            await this.setActivity();
-            lastSyncTime = Date.now();
-            lastSyncPosition = currentPosition;
-            lastTrackId = currentTrackId;
-          } else {
-            lastSyncTime = now;
-            lastSyncPosition = currentPosition;
-          }
-        } catch (err) {
-          console.error("Error in play status poll:", err);
-        }
-      }
-      console.log("Play status poll stopped.");
-    })();
+  #setCleared(): void {
+    this.#desired = { kind: "cleared" };
   }
 
-  async getPlayingActivity(): Promise<{ activity: Activity; delta?: number }> {
-    const properties = await getMusicProperties(this.appName);
-    console.log("properties:", properties);
+  #pushDesired(): void {
+    if (this.#state !== "connected" || !this.#ipc) return; // never write while disconnected
+    const activity = this.#desired.kind === "playing" ? this.#desired.activity : null;
+    const json = JSON.stringify(activity);
+    if (json === this.#lastPushedJson) return; // dedupe identical updates
+    this.#lastPushedJson = json;
+    this.#ipc.setActivity(activity).catch(() => {}); // failure handled inside DiscordIPC
+  }
 
-    let delta, start, end;
+  async #buildActivity(properties: iTunesProperties): Promise<Activity> {
+    let start: number | undefined;
+    let end: number | undefined;
     if (properties.duration) {
-      delta = (properties.duration - properties.playerPosition) * 1000;
+      const delta = (properties.duration - properties.playerPosition) * 1000;
       start = Math.ceil(Date.now() - properties.playerPosition * 1000);
       end = Math.ceil(Date.now() + delta);
     }
 
     // EVERYTHING must be less than or equal to 128 chars long
     const activity: Activity = {
-      // @ts-expect-error: "listening to" has been added in recent Discord versions
-      type: 2,
+      type: 2, // "Listening to"
       details: AppleMusicDiscordRPC.ensureValidStringLength(properties.name),
       timestamps: { start, end },
     };
 
     if (properties.artist) {
-      // @ts-expect-error: https://github.com/discord/discord-api-docs/pull/7674
       activity.status_display_type = 1;
-      activity.state = AppleMusicDiscordRPC.ensureValidStringLength(
-        properties.artist,
-      );
+      activity.state = AppleMusicDiscordRPC.ensureValidStringLength(properties.artist);
     }
 
     if (properties.album) {
       const extras = await this.cachedTrackExtras(properties);
-      console.log("extras:", extras);
+      debug("extras:", extras);
 
-      // @ts-expect-error: https://github.com/discord/discord-api-docs/pull/7674
       activity.details_url = extras.trackViewUrl;
-
-      // @ts-expect-error: https://github.com/discord/discord-api-docs/pull/7674
       activity.state_url = extras.artistViewUrl;
-
       activity.assets = {
         large_image: extras.artworkUrl,
-        large_text: AppleMusicDiscordRPC.ensureValidStringLength(
-          properties.album,
-        ),
-        // @ts-expect-error: https://github.com/discord/discord-api-docs/pull/7674
+        large_text: AppleMusicDiscordRPC.ensureValidStringLength(properties.album),
         large_url: extras.collectionViewUrl,
       };
 
       const buttons: NonNullable<Activity["buttons"]> = [];
-
       const spotifyQuery = encodeURIComponent(
         `artist:${properties.artist} track:${properties.name}`,
       );
@@ -245,13 +721,77 @@ class AppleMusicDiscordRPC {
       if (spotifyUrl.length <= 512) {
         buttons.push({ label: "Search on Spotify", url: spotifyUrl });
       }
-
       if (buttons.length > 0) {
         activity.buttons = buttons;
       }
     }
 
-    return { activity, delta };
+    return activity;
+  }
+
+  /** 5s poll bound to the connection lifecycle: runs only while connected + playing. */
+  #startPoll(): void {
+    if (this.#pollAbort || this.#state !== "connected") return;
+    const ac = new AbortController();
+    this.#pollAbort = ac;
+    const signal = ac.signal;
+
+    (async () => {
+      let lastPos = 0;
+      let lastAt = Date.now();
+      let lastId = "";
+
+      const seed = await getMusicProperties(this.appName).catch(() => null);
+      if (seed) {
+        lastPos = seed.playerPosition;
+        lastId = seed.persistentID;
+      }
+
+      while (!signal.aborted) {
+        await sleepAbortable(POLL_MS, signal);
+        if (signal.aborted) break;
+
+        try {
+          if (!(await isMusicRunning(this.appName))) {
+            await this.#scheduleRefresh(); // clears + stops poll
+            break;
+          }
+          const state = await getMusicState(this.appName);
+          if (state !== "playing") {
+            await this.#scheduleRefresh();
+            break;
+          }
+
+          const properties = await getMusicProperties(this.appName);
+          const now = Date.now();
+          const expectedPosition = lastPos + (now - lastAt) / 1000;
+          const diff = Math.abs(properties.playerPosition - expectedPosition);
+
+          // Sync if track changed, position went backward (repeat/rewind), or seeked > 3s.
+          if (
+            properties.persistentID !== lastId ||
+            properties.playerPosition < lastPos ||
+            diff > 3
+          ) {
+            debug(
+              `Timeline sync: trackChanged=${properties.persistentID !== lastId}, ` +
+                `repeated=${properties.playerPosition < lastPos}, seekDiff=${diff.toFixed(1)}s`,
+            );
+            await this.#scheduleRefresh();
+          }
+          lastAt = now;
+          lastPos = properties.playerPosition;
+          lastId = properties.persistentID;
+        } catch (err) {
+          if (DEBUG) console.error("Poll error:", errMsg(err));
+        }
+      }
+    })();
+  }
+
+  #stopPoll(): void {
+    this.#pollAbort?.abort();
+    this.#pollAbort = null;
   }
 
   async cachedTrackExtras(properties: iTunesProperties): Promise<TrackExtras> {
@@ -263,17 +803,6 @@ class AppleMusicDiscordRPC {
       await this.kv.set(["extras", cacheId], extras);
     }
     return extras;
-  }
-
-  static async create(
-    ...opts: ConstructorParameters<typeof this> extends
-      [unknown, unknown, unknown, ...infer T] ? T : never
-  ): Promise<AppleMusicDiscordRPC> {
-    const macOSVersion = await this.getMacOSVersion();
-    const appName: iTunesAppName = macOSVersion >= 10.15 ? "Music" : "iTunes";
-    const rpc = new Client({ id: this.CLIENT_IDS[appName] });
-    const kv = await Deno.openKv(`cache_v${this.KV_VERSION}.sqlite3`);
-    return new this(appName, rpc, kv, ...opts);
   }
 
   static async getMacOSVersion(): Promise<number> {
@@ -298,11 +827,6 @@ class AppleMusicDiscordRPC {
     }
   }
 }
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 //#endregion
 
 //#region JXA
@@ -473,7 +997,7 @@ globalThis.addEventListener("unload", () => {
 });
 
 async function listenToEvents(
-  onEvent: (event: any) => Promise<void>
+  onEvent: (event: any) => Promise<void> | void,
 ): Promise<never> {
   const swiftCode = `
 import Foundation
@@ -523,7 +1047,7 @@ RunLoop.current.run()
 
   try {
     while (true) {
-      console.log("Spawning swift listener process...");
+      debug("Spawning swift listener process...");
       const command = new Deno.Command("swift", {
         args: [tempSwiftFile],
         stdout: "piped",
@@ -541,26 +1065,34 @@ RunLoop.current.run()
           const { value: chunk, done } = await reader.read();
           if (done) break;
           buffer += chunk;
+          // Defensive cap: drop a pathological no-newline stream instead of growing forever.
+          if (buffer.length > MAX_FRAME_LEN && !buffer.includes("\n")) {
+            buffer = "";
+            continue;
+          }
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
             if (trimmed === "LISTENING") {
-              console.log("Swift notification listener is active.");
+              debug("Swift notification listener is active.");
               continue;
             }
             try {
               const event = JSON.parse(trimmed);
               await onEvent(event);
             } catch (e) {
-              console.error("Error parsing event line:", e);
+              console.error("Error handling event line:", e);
             }
           }
         }
       } catch (err) {
         console.error("Error reading from swift listener process:", err);
       } finally {
+        try {
+          reader.releaseLock();
+        } catch {}
         try {
           process.kill();
         } catch {}
@@ -744,5 +1276,8 @@ interface iTunesSearchResult {
 }
 //#endregion
 
-const client = await AppleMusicDiscordRPC.create();
-await client.run();
+if (import.meta.main) {
+  Logger.init("music-rpc.log");
+  const client = await AppleMusicDiscordRPC.create();
+  await client.run();
+}
